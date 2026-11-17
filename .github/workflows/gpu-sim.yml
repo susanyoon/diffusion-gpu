@@ -1,0 +1,75 @@
+name: gpu-sim
+
+# Optional check. The hosted runners have no GPU, so this builds the CUDA
+# targets and runs the cuda_tests ctest (CUDA and tiled CUDA kernels against
+# the CPU solver) on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-sim:
+    name: cuda_tests (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The simulator runs PTX only and needs a shared CUDA runtime. The
+      # CMakeLists.txt hardcodes CUDA_ARCHITECTURES native, so the checkout
+      # is patched in this job to 90-virtual (PTX only); the repository file
+      # itself is not changed.
+      - name: Configure
+        run: |
+          sed -i 's/CUDA_ARCHITECTURES native/CUDA_ARCHITECTURES 90-virtual/' CMakeLists.txt
+          grep -q 'CUDA_ARCHITECTURES 90-virtual' CMakeLists.txt
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+                -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+                -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared 2>&1 | tee configure.log
+          grep -q 'CUDA found' configure.log || { echo "::error::CUDA targets were not configured"; exit 1; }
+
+      - name: Build
+        run: vgpu run --preload cmake --build build -j3
+
+      # The test prints one pass/FAIL line per case (four cases) and exits
+      # non-zero on a mismatch above 1e-12. The guard also fails the job if
+      # cuda_tests was not built or not run, on a simulator error, or if a
+      # case line is missing.
+      - name: Run cuda_tests on the simulated GPU
+        run: |
+          set -o pipefail
+          test -x build/test_cuda || { echo "::error::test_cuda was not built"; exit 1; }
+          vgpu run ctest --test-dir build -R '^cuda_tests$' --output-on-failure -V 2>&1 | tee test.log
+          if grep -Eiq 'VirtualGPU error|no device|CUDA error|skipped|not run' test.log; then
+            echo "::error::GPU error or skipped test in the output"; exit 1
+          fi
+          grep -q 'cuda_tests \.* *Passed' test.log || { echo "::error::cuda_tests did not pass"; exit 1; }
+          grep -q '100% tests passed, 0 tests failed out of 1' test.log || { echo "::error::cuda_tests did not run"; exit 1; }
+          if grep -q 'FAIL' test.log; then echo "::error::failing case"; exit 1; fi
+          n=$(grep -c '^[0-9]*: pass: ' test.log || true)
+          echo "$n pass lines"
+          [ "$n" -eq 4 ] || { echo "::error::expected 4 pass lines"; exit 1; }
